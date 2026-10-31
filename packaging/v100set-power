@@ -1,0 +1,57 @@
+#!/usr/bin/python3 -I
+"""Root-owned helper. Accepts only a GPU UUID and a driver-supported wattage."""
+
+import csv
+import math
+import os
+import re
+import subprocess
+import sys
+
+SMI = "/usr/bin/nvidia-smi"
+ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+
+
+def validate_request(args):
+    if len(args) != 2 or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", args[0]):
+        raise ValueError("Expected a full NVIDIA GPU UUID and a power limit in watts")
+    if not re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,3})?", args[1]):
+        raise ValueError("Invalid power limit")
+    value = float(args[1])
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Invalid power limit")
+    return args[0], value
+
+
+def run(*args):
+    result = subprocess.run([SMI, *args], capture_output=True, text=True,
+                            timeout=8, env=ENV, cwd="/", check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "NVIDIA command failed")
+    return result.stdout.strip()
+
+
+def set_limit(args):
+    uuid, watts = validate_request(args)
+    rows = list(csv.reader(run("-i", uuid, "--query-gpu=uuid,power.min_limit,power.max_limit",
+                              "--format=csv,noheader,nounits").splitlines()))
+    if len(rows) != 1 or len(rows[0]) != 3 or rows[0][0].strip() != uuid:
+        raise ValueError("GPU identity could not be verified")
+    minimum, maximum = (float(v.strip()) for v in rows[0][1:])
+    if not all(math.isfinite(v) for v in (minimum, maximum)) or not 0 < minimum <= watts <= maximum:
+        raise ValueError("Requested power limit is outside the GPU's supported range")
+    run("-i", uuid, "-pl", str(watts))
+    actual = float(run("-i", uuid, "--query-gpu=power.limit", "--format=csv,noheader,nounits"))
+    if not math.isfinite(actual) or abs(actual - watts) > 0.1:
+        raise RuntimeError("NVIDIA did not confirm the requested power limit")
+    return actual
+
+
+if __name__ == "__main__":
+    try:
+        if os.geteuid() != 0:
+            raise PermissionError("Administrator installation is required")
+        print(set_limit(sys.argv[1:]))
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

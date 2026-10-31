@@ -1,0 +1,386 @@
+"""GTK panel with an AppIndicator tray entry."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as Indicator, Gio, GLib, Gtk, Gdk
+
+from .core import Settings, apply_limit, discover, load_targets
+
+CSS = b"""
+window { background: #171b24; color: #eef2f8; }
+.panel { padding: 20px; }
+.title { font-size: 22px; font-weight: bold; }
+.muted { color: #9caac1; font-size: 11px; }
+.card { background: #222938; border-radius: 12px; padding: 14px; }
+.gpu-name { font-weight: bold; font-size: 13px; }
+.reading { font-weight: bold; font-size: 16px; }
+scale trough { background: #3a455a; min-height: 6px; border-radius: 6px; }
+scale highlight { background: #67d5b5; border-radius: 6px; }
+scale slider { background: #e8fff7; min-width: 15px; min-height: 15px; border-radius: 50%; }
+scale value { color: #8ee4c9; font-weight: bold; }
+button { background: #313d52; color: #eef2f8; border: none; border-radius: 8px; padding: 8px 12px; }
+button:hover { background: #43536e; }
+.status { font-size: 11px; color: #bbc9dc; }
+"""
+
+
+def label(text, style=None, xalign=0):
+    widget = Gtk.Label(label=text, xalign=xalign)
+    if style:
+        widget.get_style_context().add_class(style)
+    return widget
+
+
+class Card(Gtk.Box):
+    def __init__(self, gpu, changed):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.get_style_context().add_class("card")
+        self.gpu = gpu
+        self.block = False
+        self.pack_start(label(gpu.name, "gpu-name"), False, False, 0)
+        self.pack_start(label(f"PCI {gpu.bus} · {gpu.uuid[-8:]}", "muted"), False, False, 0)
+        row = Gtk.Box(spacing=12)
+        self.draw = label("— W", "reading")
+        self.draw.set_size_request(75, -1)
+        self.temp = label("— °C", "reading", 1)
+        self.temp.set_size_request(60, -1)
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
+                                             gpu.minimum if gpu.adjustable else 0,
+                                             gpu.maximum if gpu.adjustable else 1, 1)
+        self.scale.set_digits(0)
+        self.scale.set_value_pos(Gtk.PositionType.TOP)
+        self.scale.connect("format-value", lambda _, value: f"{value:.0f} W limit")
+        self.scale.set_hexpand(True)
+        self.scale.set_size_request(220, -1)
+        self.scale.set_sensitive(gpu.adjustable)
+        self.scale.set_tooltip_text("Changes apply live. SAVE stores limits for later use.")
+        if gpu.adjustable:
+            self.scale.add_mark(gpu.minimum, Gtk.PositionType.BOTTOM, f"{gpu.minimum:g}")
+            self.scale.add_mark(gpu.maximum, Gtk.PositionType.BOTTOM, f"{gpu.maximum:g} W")
+            self.scale.set_value(gpu.limit)
+        self.scale.connect("value-changed", lambda widget: None if self.block else changed(gpu.uuid, widget.get_value()))
+        row.pack_start(self.draw, False, False, 0)
+        row.pack_start(self.scale, True, True, 0)
+        row.pack_start(self.temp, False, False, 0)
+        self.pack_start(row, False, False, 0)
+        self.detail = label("", "muted")
+        self.pack_start(self.detail, False, False, 0)
+        self.update(gpu, False)
+
+    def set_value(self, value):
+        self.block = True
+        self.scale.set_value(value)
+        self.block = False
+
+    def update(self, gpu, pending):
+        self.gpu = gpu
+        self.draw.set_text("— W" if gpu.draw is None else f"{gpu.draw:.1f} W")
+        self.temp.set_text("— °C" if gpu.temperature is None else f"{gpu.temperature:.0f} °C")
+        self.detail.set_text("Power limit control unavailable" if not gpu.adjustable else
+                             f"Applied: {gpu.limit:g} W" + (" · Applying…" if pending else ""))
+        if not pending and gpu.adjustable and not self.scale.has_focus():
+            self.set_value(gpu.limit)
+
+
+class App(Gtk.Application):
+    def __init__(self, startup=False):
+        super().__init__(application_id="io.github.v100set", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.startup = startup
+        self.settings = Settings()
+        self.window = None
+        self.cards = {}
+        self.pending = {}
+        self.timers = {}
+        self.busy = set()
+        self.polling = False
+        self.loading = False
+        self.load_errors = []
+        self.poll_pool = ThreadPoolExecutor(max_workers=1)
+        self.apply_pool = ThreadPoolExecutor(max_workers=1)
+        self.attempts = 0
+        self.revision = 0
+        self.closed = False
+        self.poll_source = None
+        self.connect("activate", self.activate)
+        self.connect("shutdown", self.cleanup)
+
+    def message(self, text):
+        self.status.set_text(text)
+        self.status.set_tooltip_text(text)
+
+    def activate(self, _app):
+        if self.window:
+            self.window.show_all()
+            self.window.present()
+            return
+        try:
+            data = self.settings.read()
+        except (ValueError, OSError) as exc:
+            data = {"start_at_login": False}
+            error = str(exc)
+        else:
+            error = None
+        if self.startup and not data["start_at_login"]:
+            self.quit()
+            return
+        self.restore_on_start = self.startup
+        self.hold()
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.window = Gtk.ApplicationWindow(application=self, title="v100set")
+        self.window.set_default_size(510, -1)
+        self.window.set_resizable(False)
+        self.window.set_position(Gtk.WindowPosition.CENTER)
+        self.window.set_keep_above(True)
+        self.window.connect("delete-event", lambda *_: self.hide())
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.get_style_context().add_class("panel")
+        self.window.add(outer)
+        header = Gtk.Box(spacing=10)
+        header.pack_start(label("v100set", "title"), True, True, 0)
+        hide = Gtk.Button(label="Hide")
+        hide.connect("clicked", lambda *_: self.hide())
+        header.pack_end(hide, False, False, 0)
+        outer.pack_start(header, False, False, 0)
+        outer.pack_start(label("NVIDIA POWER CONTROL", "muted"), False, False, 0)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_max_content_height(570)
+        self.rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        scroll.add(self.rows)
+        outer.pack_start(scroll, True, True, 0)
+        self.status = label(error or "Detecting NVIDIA GPUs…", "status")
+        self.status.set_line_wrap(True)
+        self.status.set_max_width_chars(65)
+        outer.pack_start(self.status, False, False, 0)
+        buttons = Gtk.Box(spacing=10, homogeneous=True)
+        self.load_button = Gtk.Button(label="LOAD")
+        self.save_button = Gtk.Button(label="SAVE")
+        self.load_button.connect("clicked", lambda *_: self.load())
+        self.save_button.connect("clicked", lambda *_: self.save())
+        buttons.pack_start(self.load_button, True, True, 0)
+        buttons.pack_start(self.save_button, True, True, 0)
+        outer.pack_start(buttons, False, False, 0)
+        self.start_check = Gtk.CheckButton(label="Start at login and apply saved limits")
+        self.start_check.set_active(data["start_at_login"])
+        self.start_check.connect("toggled", self.toggle_startup)
+        outer.pack_start(self.start_check, False, False, 0)
+        self.indicator = Indicator.Indicator.new(self.get_application_id().replace(".", "-"), "v100set", Indicator.IndicatorCategory.HARDWARE)
+        self.indicator.set_status(Indicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("v100set")
+        menu = Gtk.Menu()
+        show = Gtk.MenuItem(label="Power controls")
+        show.connect("activate", lambda *_: self.activate(self))
+        menu.append(show)
+        self.indicator.set_secondary_activate_target(show)
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit v100set")
+        quit_item.connect("activate", lambda *_: self.quit())
+        menu.append(quit_item)
+        menu.show_all()
+        self.indicator.set_menu(menu)
+        self.window.show_all()
+        if self.startup:
+            self.window.hide()
+        self.poll()
+        self.poll_source = GLib.timeout_add_seconds(2, self.poll)
+
+    def cleanup(self, _app):
+        self.closed = True
+        if self.poll_source:
+            GLib.source_remove(self.poll_source)
+        for source in self.timers.values():
+            GLib.source_remove(source)
+        self.timers.clear()
+        if self.window:
+            self.indicator.set_status(Indicator.IndicatorStatus.PASSIVE)
+            self.window.destroy()
+
+    def hide(self):
+        self.window.hide()
+        return True
+
+    def controls(self):
+        idle = not self.pending and not self.busy
+        self.save_button.set_sensitive(idle and any(c.gpu.adjustable for c in self.cards.values()))
+        self.load_button.set_sensitive(idle and bool(self.cards))
+
+    def poll(self):
+        if self.closed:
+            return False
+        if not self.polling:
+            self.polling = True
+            self.poll_pool.submit(self.read_hardware)
+        return True
+
+    def read_hardware(self):
+        revision = self.revision
+        try:
+            gpus, error = discover(), None
+        except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+            gpus, error = [], str(exc)
+        except Exception as exc:
+            gpus, error = [], f"Telemetry unavailable: {exc}"
+        GLib.idle_add(self.refresh, gpus, error, revision)
+
+    def refresh(self, gpus, error, revision):
+        self.polling = False
+        if self.closed:
+            return False
+        if revision != self.revision:
+            self.poll()
+            return False
+        self.attempts += 1
+        if error:
+            self.message(f"Cannot read GPUs: {error}")
+            for card in self.cards.values():
+                card.scale.set_sensitive(False)
+                card.draw.set_text("— W")
+                card.temp.set_text("— °C")
+            self.save_button.set_sensitive(False)
+            self.load_button.set_sensitive(False)
+        else:
+            ids = {g.uuid for g in gpus}
+            for uuid in list(self.cards):
+                if uuid not in ids:
+                    self.rows.remove(self.cards.pop(uuid))
+                    self.pending.pop(uuid, None)
+                    if uuid in self.timers:
+                        GLib.source_remove(self.timers.pop(uuid))
+            for gpu in gpus:
+                if gpu.uuid not in self.cards:
+                    self.cards[gpu.uuid] = Card(gpu, self.changed)
+                    self.rows.pack_start(self.cards[gpu.uuid], False, False, 0)
+                card = self.cards[gpu.uuid]
+                card.scale.set_sensitive(gpu.adjustable)
+                card.update(gpu, gpu.uuid in self.pending or gpu.uuid in self.busy)
+            self.rows.show_all()
+            self.controls()
+            if self.attempts == 1:
+                self.message(f"{len(gpus)} NVIDIA GPU(s) · Drag a slider to set its limit" if gpus else "No NVIDIA GPUs detected")
+            if self.restore_on_start and gpus:
+                self.restore_on_start = False
+                self.load()
+        if self.restore_on_start and self.attempts >= 15:
+            self.restore_on_start = False
+            self.message("Startup restore failed: NVIDIA GPUs did not become available. Use LOAD to retry.")
+        return False
+
+    def changed(self, uuid, watts):
+        self.pending[uuid] = round(watts)
+        if uuid in self.timers:
+            GLib.source_remove(self.timers.pop(uuid))
+        self.timers[uuid] = GLib.timeout_add(400, self.dispatch, uuid)
+        self.controls()
+
+    def dispatch(self, uuid):
+        self.timers.pop(uuid, None)
+        if uuid in self.busy or uuid not in self.pending or uuid not in self.cards:
+            return False
+        watts = self.pending.pop(uuid)
+        try:
+            self.cards[uuid].gpu.validate(watts)
+        except ValueError as exc:
+            self.message(str(exc))
+            self.controls()
+            return False
+        self.busy.add(uuid)
+        self.revision += 1
+        self.message(f"Applying {watts:g} W to {self.cards[uuid].gpu.name}…")
+        self.controls()
+        self.apply_pool.submit(self.apply_worker, uuid, watts)
+        return False
+
+    def apply_worker(self, uuid, watts):
+        try:
+            actual, error = apply_limit(uuid, watts), None
+        except Exception as exc:
+            actual, error = None, str(exc)
+        GLib.idle_add(self.applied, uuid, actual, error)
+
+    def applied(self, uuid, actual, error):
+        if self.closed:
+            return False
+        self.busy.discard(uuid)
+        self.revision += 1
+        if error:
+            self.load_errors.append(error)
+            self.message(f"Could not apply limit: {error}")
+            if uuid in self.cards and uuid not in self.pending:
+                self.cards[uuid].set_value(self.cards[uuid].gpu.limit)
+        elif uuid in self.cards:
+            if uuid not in self.pending:
+                self.cards[uuid].set_value(actual)
+            self.message(f"Applied {actual:g} W · SAVE to remember these limits")
+        if uuid in self.pending:
+            if uuid in self.timers:
+                GLib.source_remove(self.timers.pop(uuid))
+            self.dispatch(uuid)
+        if self.loading and not self.busy and not self.pending:
+            self.message("; ".join(self.load_errors) if self.load_errors else "Saved limits applied")
+            self.loading = False
+        self.controls()
+        self.poll()
+        return False
+
+    def save(self):
+        try:
+            limits = {u: c.gpu.validate(c.scale.get_value()) for u, c in self.cards.items() if c.gpu.adjustable}
+            self.settings.save_limits(limits)
+            self.message("Limits saved · " + ("Will apply at login" if self.start_check.get_active() else "Autostart is off"))
+        except (OSError, ValueError) as exc:
+            self.message(f"Could not save: {exc}")
+
+    def load(self):
+        try:
+            saved = self.settings.read()["limits"]
+            targets, errors = load_targets([c.gpu for c in self.cards.values()], saved)
+        except (OSError, ValueError) as exc:
+            self.message(f"Could not load: {exc}")
+            return
+        if not targets:
+            self.message("; ".join(errors) if errors else "No saved limits yet. Choose limits and press SAVE.")
+            return
+        self.loading = True
+        self.load_errors = errors
+        for uuid, watts in targets.items():
+            self.cards[uuid].set_value(watts)
+            self.pending[uuid] = watts
+        for uuid in targets:
+            self.dispatch(uuid)
+
+    def toggle_startup(self, checkbox):
+        enabled = checkbox.get_active()
+        try:
+            self.settings.set_startup(enabled)
+            self.message("Autostart enabled · SAVE the limits you want restored" if enabled else
+                         "Autostart disabled · Current GPU limits are unchanged")
+        except (OSError, ValueError) as exc:
+            checkbox.handler_block_by_func(self.toggle_startup)
+            checkbox.set_active(not enabled)
+            checkbox.handler_unblock_by_func(self.toggle_startup)
+            self.message(f"Could not change autostart: {exc}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="NVIDIA power controls")
+    parser.add_argument("--startup", action="store_true", help="Restore saved limits if autostart is enabled")
+    args = parser.parse_args()
+    app = App(args.startup)
+    try:
+        return app.run([])
+    finally:
+        app.poll_pool.shutdown(wait=False, cancel_futures=True)
+        app.apply_pool.shutdown(wait=False, cancel_futures=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
