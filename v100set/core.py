@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -43,6 +44,19 @@ class GPU:
         if not self.adjustable or value is None or not self.minimum <= value <= self.maximum:
             raise ValueError(f"{self.name}: power limit is outside the supported range")
         return value
+
+
+def is_v100(gpu):
+    return re.search(r"\bV100(?:S)?\b", gpu.name, re.IGNORECASE) is not None
+
+
+def snap_limit(gpu, watts):
+    """Round user selections to a 5 W grid inside the driver's range."""
+    low = math.ceil(gpu.minimum / 5) * 5
+    high = math.floor(gpu.maximum / 5) * 5
+    if low > high:
+        raise ValueError("No supported 5 W power limit")
+    return max(low, min(high, math.floor(watts / 5 + 0.5) * 5))
 
 
 def parse_gpus(output):
@@ -121,7 +135,7 @@ class Settings:
                 atomic_write(self.autostart, "[Desktop Entry]\nType=Application\nName=v100set\n"
                              "Comment=Restore saved NVIDIA power limits\n"
                              "Exec=/usr/local/bin/v100set --startup\nIcon=v100set\n"
-                             "Terminal=false\nX-GNOME-Autostart-enabled=true\n")
+                             "StartupWMClass=v100set\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
             else:
                 self.autostart.unlink(missing_ok=True)
         except OSError:
@@ -137,10 +151,10 @@ class Settings:
 def load_targets(gpus, saved):
     targets, errors = {}, []
     for gpu in gpus:
-        if gpu.uuid not in saved:
+        if not is_v100(gpu) or gpu.uuid not in saved:
             continue
         try:
-            targets[gpu.uuid] = gpu.validate(saved[gpu.uuid])
+            targets[gpu.uuid] = snap_limit(gpu, gpu.validate(saved[gpu.uuid]))
         except ValueError as exc:
             errors.append(str(exc))
     missing = set(saved) - {g.uuid for g in gpus}

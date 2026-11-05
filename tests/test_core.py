@@ -24,7 +24,7 @@ class HardwareTests(unittest.TestCase):
 
     def test_saved_uuid_survives_device_reordering(self):
         targets, errors = load_targets(list(reversed(parse_gpus(SAMPLE))), {A: 175, B: 45})
-        self.assertEqual(targets, {A: 175, B: 45})
+        self.assertEqual(targets, {A: 175})
         self.assertEqual(errors, [])
 
     def test_removed_gpu_and_invalid_limit_are_not_applied(self):

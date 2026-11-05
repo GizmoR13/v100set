@@ -9,7 +9,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import AyatanaAppIndicator3 as Indicator, Gio, GLib, Gtk, Gdk
 
-from .core import Settings, apply_limit, discover, load_targets
+from .core import Settings, apply_limit, discover, load_targets, snap_limit, is_v100
 
 CSS = b"""
 window { background: #171b24; color: #eef2f8; }
@@ -51,7 +51,7 @@ class Card(Gtk.Box):
         self.temp.set_size_request(60, -1)
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
                                              gpu.minimum if gpu.adjustable else 0,
-                                             gpu.maximum if gpu.adjustable else 1, 1)
+                                             gpu.maximum if gpu.adjustable else 1, 5)
         self.scale.set_digits(0)
         self.scale.set_value_pos(Gtk.PositionType.TOP)
         self.scale.connect("format-value", lambda _, value: f"{value:.0f} W limit")
@@ -94,6 +94,7 @@ class App(Gtk.Application):
         self.settings = Settings()
         self.window = None
         self.cards = {}
+        self.detected = []
         self.pending = {}
         self.timers = {}
         self.busy = set()
@@ -115,8 +116,7 @@ class App(Gtk.Application):
 
     def activate(self, _app):
         if self.window:
-            self.window.show_all()
-            self.window.present()
+            self.show_panel()
             return
         try:
             data = self.settings.read()
@@ -135,6 +135,8 @@ class App(Gtk.Application):
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.window = Gtk.ApplicationWindow(application=self, title="v100set")
+        self.window.set_wmclass("v100set", "v100set")
+        self.window.set_icon_name("v100set")
         self.window.set_default_size(510, -1)
         self.window.set_resizable(False)
         self.window.set_position(Gtk.WindowPosition.CENTER)
@@ -187,9 +189,9 @@ class App(Gtk.Application):
         menu.append(quit_item)
         menu.show_all()
         self.indicator.set_menu(menu)
-        self.window.show_all()
-        if self.startup:
-            self.window.hide()
+        outer.show_all()
+        if not self.startup:
+            self.show_panel()
         self.poll()
         self.poll_source = GLib.timeout_add_seconds(2, self.poll)
 
@@ -203,6 +205,12 @@ class App(Gtk.Application):
         if self.window:
             self.indicator.set_status(Indicator.IndicatorStatus.PASSIVE)
             self.window.destroy()
+
+    def show_panel(self):
+        self.window.show_all()
+        self.window.deiconify()
+        self.window.set_position(Gtk.WindowPosition.CENTER)
+        self.window.present_with_time(Gtk.get_current_event_time())
 
     def hide(self):
         self.window.hide()
@@ -248,6 +256,8 @@ class App(Gtk.Application):
             self.save_button.set_sensitive(False)
             self.load_button.set_sensitive(False)
         else:
+            self.detected = gpus
+            gpus = [gpu for gpu in gpus if is_v100(gpu)]
             ids = {g.uuid for g in gpus}
             for uuid in list(self.cards):
                 if uuid not in ids:
@@ -265,7 +275,7 @@ class App(Gtk.Application):
             self.rows.show_all()
             self.controls()
             if self.attempts == 1:
-                self.message(f"{len(gpus)} NVIDIA GPU(s) · Drag a slider to set its limit" if gpus else "No NVIDIA GPUs detected")
+                self.message(f"{len(gpus)} V100 GPU(s) · Drag a slider to set its limit" if gpus else "No V100 GPUs detected")
             if self.restore_on_start and gpus:
                 self.restore_on_start = False
                 self.load()
@@ -275,7 +285,9 @@ class App(Gtk.Application):
         return False
 
     def changed(self, uuid, watts):
-        self.pending[uuid] = round(watts)
+        watts = snap_limit(self.cards[uuid].gpu, watts)
+        self.cards[uuid].set_value(watts)
+        self.pending[uuid] = watts
         if uuid in self.timers:
             GLib.source_remove(self.timers.pop(uuid))
         self.timers[uuid] = GLib.timeout_add(400, self.dispatch, uuid)
@@ -342,7 +354,7 @@ class App(Gtk.Application):
     def load(self):
         try:
             saved = self.settings.read()["limits"]
-            targets, errors = load_targets([c.gpu for c in self.cards.values()], saved)
+            targets, errors = load_targets(self.detected, saved)
         except (OSError, ValueError) as exc:
             self.message(f"Could not load: {exc}")
             return
@@ -374,6 +386,9 @@ def main():
     parser = argparse.ArgumentParser(description="NVIDIA power controls")
     parser.add_argument("--startup", action="store_true", help="Restore saved limits if autostart is enabled")
     args = parser.parse_args()
+    GLib.set_prgname("v100set")
+    GLib.set_application_name("v100set")
+    Gtk.Window.set_default_icon_name("v100set")
     app = App(args.startup)
     try:
         return app.run([])

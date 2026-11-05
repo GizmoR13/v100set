@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $EUID -ne 0 ]]; then
-    echo "Run: sudo bash install.sh YOUR_USERNAME [--replace-v100-service]" >&2
+    echo "Run: sudo bash install.sh YOUR_USERNAME" >&2
     exit 1
 fi
 target_user="${1:-${SUDO_USER:-}}"
 [[ $target_user =~ ^[a-z_][a-z0-9_-]*\$?$ && $target_user != root ]] || { echo 'Supply a non-root local username' >&2; exit 1; }
 id "$target_user" >/dev/null
-[[ $# -le 2 && ${2:-} =~ ^(--replace-v100-service)?$ ]] || { echo 'Unknown installer option' >&2; exit 1; }
+[[ $# -le 1 ]] || { echo 'Unknown installer option' >&2; exit 1; }
 source_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 command -v nvidia-smi >/dev/null || { echo 'Install your NVIDIA driver first.' >&2; exit 1; }
 if ! /usr/bin/python3 -c "import gi; gi.require_version('Gtk','3.0'); gi.require_version('AyatanaAppIndicator3','0.1')" 2>/dev/null; then
@@ -32,10 +32,6 @@ chown root:root /usr/local/bin/v100set
 chmod 755 /usr/local/bin/v100set
 install -D -o root -g root -m 644 "$source_dir/assets/v100set.svg" /usr/share/icons/hicolor/scalable/apps/v100set.svg
 install -o root -g root -m 644 "$source_dir/packaging/v100set.desktop" /usr/share/applications/v100set.desktop
-if [[ ${2:-} == --replace-v100-service ]]; then
-    systemctl disable v100-power-limit.service
-    echo 'Disabled the previous v100-power-limit boot service; its files and current limits are unchanged.'
-fi
 if command -v gtk-update-icon-cache >/dev/null; then
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 fi

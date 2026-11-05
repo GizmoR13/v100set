@@ -37,10 +37,11 @@ def later(ms,func):
     GLib.timeout_add(ms,guarded)
 
 def start():
-    assert len(application.cards)==3, 'GPU rows missing'
+    assert len(application.cards)==2 and A not in application.cards, 'GPU rows missing'
     application.cards[B].scale.set_value(199)
     application.cards[B].scale.set_value(198)
-    application.cards[B].scale.set_value(195)
+    application.cards[B].scale.set_value(193)
+    assert application.cards[B].scale.get_value() == 195
     later(1000,saved)
 
 def saved():
@@ -71,7 +72,7 @@ def finish():
         size=application.window.get_size()
         image=Gdk.pixbuf_get_from_window(window,0,0,size.width,size.height)
         image.savev(sys.argv[1],'png',[],[])
-    print('GUI PASS: 3 cards, debounced live apply, SAVE, LOAD, autostart on/off')
+    print('GUI PASS: 2 V100 cards, A400 excluded, 5 W snapping, debounced live apply, SAVE, LOAD, autostart on/off')
     application.quit()
 
 with patch.object(ui,'discover',side_effect=lambda:list(gpus)), patch.object(ui,'apply_limit',side_effect=apply):
@@ -93,7 +94,13 @@ with patch.object(ui,'discover',side_effect=lambda:list(gpus)), patch.object(ui,
             assert not application.window.get_visible(), 'Startup should remain in tray'
             assert gpus[1].limit==195, 'Startup did not restore saved limit'
             assert not application.restore_on_start
-            print('GUI PASS: enabled login startup restores saved limits and stays hidden')
+            application.show_panel()
+            assert application.window.get_visible()
+            application.hide()
+            application.activate(application)
+            assert application.window.get_visible()
+            assert all(uuid != A for uuid, _ in calls)
+            print('GUI PASS: window reopens; enabled login startup restores saved limits and stays hidden')
             application.quit()
         later(1800,check_startup)
         application.run([])

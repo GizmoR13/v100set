@@ -7,3 +7,4 @@ Icon=v100set
 Terminal=false
 Categories=System;Settings;HardwareSettings;
 StartupNotify=true
+StartupWMClass=v100set
