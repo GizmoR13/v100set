@@ -23,6 +23,11 @@ The installer adds GTK 3 and Ayatana AppIndicator bindings when missing. It does
 
 ## Use
 
+- Supports 1–8 V100 GPUs: up to four in one column, then a second column (cards 5–8).
+- Resize the window to scale text and controls. The last window size is restored on the next launch.
+- **Link all GPU sliders** applies each slider change to all controllable V100 GPUs in 5 W steps, clamped to each GPU’s supported range. Enabling the checkbox alone does not change limits; LOAD still restores each card’s individual saved limit. The checkbox preference is remembered.
+
+
 - Open the tray icon → **Power controls**. On supported desktops, middle-click opens the panel directly. AppIndicator hosts own the tray menu, so opening it is not a custom slider popup inside the system volume menu.
 - Drag a slider to change the limit live. Changes are debounced by 400 ms and verified against the driver. GPU identity uses UUID, never a possibly changing index.
 - **SAVE** stores the selected limits in `~/.config/v100set/settings.json`.
@@ -48,6 +53,7 @@ Only V100/V100S GPUs discovered by the NVIDIA driver are shown; AMD/Intel power 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 tests/gui_smoke.py
+python3 tests/gui_layout.py
 python3 run.py
 ```
 

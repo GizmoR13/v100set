@@ -1,6 +1,7 @@
 """GTK panel with an AppIndicator tray entry."""
 
 import argparse
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -44,7 +45,7 @@ class Card(Gtk.Box):
         self.block = False
         self.pack_start(label(gpu.name, "gpu-name"), False, False, 0)
         self.pack_start(label(f"PCI {gpu.bus} · {gpu.uuid[-8:]}", "muted"), False, False, 0)
-        row = Gtk.Box(spacing=12)
+        row = self.row = Gtk.Box(spacing=12)
         self.draw = label("— W", "reading")
         self.draw.set_size_request(75, -1)
         self.temp = label("— °C", "reading", 1)
@@ -60,8 +61,7 @@ class Card(Gtk.Box):
         self.scale.set_sensitive(gpu.adjustable)
         self.scale.set_tooltip_text("Changes apply live. SAVE stores limits for later use.")
         if gpu.adjustable:
-            self.scale.add_mark(gpu.minimum, Gtk.PositionType.BOTTOM, f"{gpu.minimum:g}")
-            self.scale.add_mark(gpu.maximum, Gtk.PositionType.BOTTOM, f"{gpu.maximum:g} W")
+            self.scale.set_tooltip_text(f"Range: {gpu.minimum:g}–{gpu.maximum:g} W · 5 W steps. Changes apply live.")
             self.scale.set_value(gpu.limit)
         self.scale.connect("value-changed", lambda widget: None if self.block else changed(gpu.uuid, widget.get_value()))
         row.pack_start(self.draw, False, False, 0)
@@ -107,6 +107,10 @@ class App(Gtk.Application):
         self.revision = 0
         self.closed = False
         self.poll_source = None
+        self.resize_source = None
+        self.layout_ids = ()
+        self.ui_scale = 1.0
+        self.last_size = None
         self.connect("activate", self.activate)
         self.connect("shutdown", self.cleanup)
 
@@ -130,40 +134,44 @@ class App(Gtk.Application):
             return
         self.restore_on_start = self.startup
         self.hold()
-        provider = Gtk.CssProvider()
+        provider = self.provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.window = Gtk.ApplicationWindow(application=self, title="v100set")
         self.window.set_wmclass("v100set", "v100set")
         self.window.set_icon_name("v100set")
-        self.window.set_default_size(510, -1)
-        self.window.set_resizable(False)
+        size = data.get("window_size")
+        self.saved_size = (size if isinstance(size, list) and len(size) == 2
+                           and all(type(v) is int and 350 <= v <= 8000 for v in size) else None)
+        self.window.set_default_size(*(self.saved_size or [530, 600]))
+        self.window.set_resizable(True)
+        self.window.connect("configure-event", self.resized)
         self.window.set_position(Gtk.WindowPosition.CENTER)
         self.window.set_keep_above(True)
         self.window.connect("delete-event", lambda *_: self.hide())
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer = self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         outer.get_style_context().add_class("panel")
         self.window.add(outer)
-        header = Gtk.Box(spacing=10)
+        outer.pack_start(label("NVIDIA POWER CONTROL", "muted"), False, False, 0)
+        header = self.header = Gtk.Box(spacing=10)
         header.pack_start(label("v100set", "title"), True, True, 0)
         hide = Gtk.Button(label="Hide")
         hide.connect("clicked", lambda *_: self.hide())
         header.pack_end(hide, False, False, 0)
         outer.pack_start(header, False, False, 0)
-        outer.pack_start(label("NVIDIA POWER CONTROL", "muted"), False, False, 0)
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_propagate_natural_height(True)
         scroll.set_max_content_height(570)
-        self.rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.rows = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True, row_homogeneous=True)
         scroll.add(self.rows)
         outer.pack_start(scroll, True, True, 0)
         self.status = label(error or "Detecting NVIDIA GPUs…", "status")
         self.status.set_line_wrap(True)
         self.status.set_max_width_chars(65)
         outer.pack_start(self.status, False, False, 0)
-        buttons = Gtk.Box(spacing=10, homogeneous=True)
+        buttons = self.buttons = Gtk.Box(spacing=10, homogeneous=True)
         self.load_button = Gtk.Button(label="LOAD")
         self.save_button = Gtk.Button(label="SAVE")
         self.load_button.connect("clicked", lambda *_: self.load())
@@ -171,6 +179,11 @@ class App(Gtk.Application):
         buttons.pack_start(self.load_button, True, True, 0)
         buttons.pack_start(self.save_button, True, True, 0)
         outer.pack_start(buttons, False, False, 0)
+        self.link_check = Gtk.CheckButton(label="Link all GPU sliders")
+        self.link_check.set_tooltip_text("Apply changes to all controllable V100 GPUs, within each card's supported range.")
+        self.link_check.set_active(data.get("link_sliders") is True)
+        self.link_check.connect("toggled", self.toggle_link)
+        outer.pack_start(self.link_check, False, False, 0)
         self.start_check = Gtk.CheckButton(label="Start at login and apply saved limits")
         self.start_check.set_active(data["start_at_login"])
         self.start_check.connect("toggled", self.toggle_startup)
@@ -196,6 +209,9 @@ class App(Gtk.Application):
         self.poll_source = GLib.timeout_add_seconds(2, self.poll)
 
     def cleanup(self, _app):
+        if self.resize_source:
+            GLib.source_remove(self.resize_source)
+        self.persist_size()
         self.closed = True
         if self.poll_source:
             GLib.source_remove(self.poll_source)
@@ -268,10 +284,11 @@ class App(Gtk.Application):
             for gpu in gpus:
                 if gpu.uuid not in self.cards:
                     self.cards[gpu.uuid] = Card(gpu, self.changed)
-                    self.rows.pack_start(self.cards[gpu.uuid], False, False, 0)
+
                 card = self.cards[gpu.uuid]
                 card.scale.set_sensitive(gpu.adjustable)
                 card.update(gpu, gpu.uuid in self.pending or gpu.uuid in self.busy)
+            self.layout_cards()
             self.rows.show_all()
             self.controls()
             if self.attempts == 1:
@@ -285,13 +302,82 @@ class App(Gtk.Application):
         return False
 
     def changed(self, uuid, watts):
-        watts = snap_limit(self.cards[uuid].gpu, watts)
-        self.cards[uuid].set_value(watts)
-        self.pending[uuid] = watts
-        if uuid in self.timers:
-            GLib.source_remove(self.timers.pop(uuid))
-        self.timers[uuid] = GLib.timeout_add(400, self.dispatch, uuid)
+        targets = self.cards.items() if self.link_check.get_active() else [(uuid, self.cards[uuid])]
+        for target, card in targets:
+            if not card.gpu.adjustable:
+                continue
+            value = snap_limit(card.gpu, watts)
+            card.set_value(value)
+            self.pending[target] = value
+            if target in self.timers:
+                GLib.source_remove(self.timers.pop(target))
+            self.timers[target] = GLib.timeout_add(400, self.dispatch, target)
         self.controls()
+
+    def toggle_link(self, checkbox):
+        try:
+            self.settings.save_ui(link_sliders=checkbox.get_active())
+        except (OSError, ValueError) as exc:
+            self.message(f"Could not save slider preference: {exc}")
+
+    def layout_cards(self):
+        ids = tuple(self.cards)
+        if ids == self.layout_ids:
+            return
+        self.layout_ids = ids
+        for child in self.rows.get_children():
+            self.rows.remove(child)
+        for index, card in enumerate(self.cards.values()):
+            self.rows.attach(card, index // 4, index % 4, 1, 1)
+        if not self.saved_size:
+            width, height = self.base_size()
+            screen = self.window.get_screen()
+            self.window.resize(min(width, screen.get_width() - 80), min(height, screen.get_height() - 100))
+        self.apply_scale(*self.window.get_size())
+
+    def base_size(self):
+        return (530 if len(self.cards) <= 4 else 1050, 280 + 145 * min(4, max(1, len(self.cards))))
+
+    def apply_scale(self, width, height):
+        base_w, base_h = self.base_size()
+        factor = max(0.7, min(2.5, width / base_w, height / base_h))
+        self.ui_scale = factor
+        css = re.sub(rb"(\d+)px", lambda m: str(max(1, round(int(m[1]) * factor))).encode() + b"px", CSS)
+        css += f"\nwindow {{ font-size: {round(13 * factor)}px; }}".encode()
+        self.provider.load_from_data(css)
+        gap = round(10 * factor)
+        self.outer.set_spacing(gap)
+        self.header.set_spacing(gap)
+        self.buttons.set_spacing(gap)
+        self.rows.set_row_spacing(gap)
+        self.rows.set_column_spacing(gap)
+        for card in self.cards.values():
+            card.set_spacing(round(6 * factor))
+            card.row.set_spacing(round(12 * factor))
+            card.draw.set_size_request(round(75 * factor), -1)
+            card.temp.set_size_request(round(60 * factor), -1)
+            card.scale.set_size_request(round(220 * factor), -1)
+
+    def resized(self, _window, event):
+        size = [event.width, event.height]
+        if not self.cards or not self.window.get_visible() or size == self.last_size:
+            return False
+        self.last_size = size
+        self.apply_scale(*size)
+        if self.resize_source:
+            GLib.source_remove(self.resize_source)
+        self.resize_source = GLib.timeout_add(500, self.persist_size)
+        return False
+
+    def persist_size(self):
+        self.resize_source = None
+        if self.last_size:
+            try:
+                self.settings.save_ui(window_size=self.last_size)
+                self.saved_size = self.last_size
+            except (OSError, ValueError) as exc:
+                self.message(f"Could not save window size: {exc}")
+        return False
 
     def dispatch(self, uuid):
         self.timers.pop(uuid, None)

@@ -142,6 +142,11 @@ class Settings:
             self.write(previous)
             raise
 
+    def save_ui(self, **values):
+        data = self.read()
+        data.update(values)
+        self.write(data)
+
     def save_limits(self, limits):
         data = self.read()
         data["limits"].update(limits)
