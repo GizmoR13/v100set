@@ -10,7 +10,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import AyatanaAppIndicator3 as Indicator, Gio, GLib, Gtk, Gdk
 
-from .core import Settings, apply_limit, discover, load_targets, snap_limit, is_v100
+from .core import Settings, apply_limit, discover, load_targets, snap_limit, is_v100, apply_clock
 
 CSS = b"""
 window { background: #171b24; color: #eef2f8; }
@@ -20,6 +20,7 @@ window { background: #171b24; color: #eef2f8; }
 .card { background: #222938; border-radius: 12px; padding: 14px; }
 .gpu-name { font-weight: bold; font-size: 13px; }
 .reading { font-weight: bold; font-size: 16px; }
+scale { padding: 2px 0; }
 scale trough { background: #3a455a; min-height: 6px; border-radius: 6px; }
 scale highlight { background: #67d5b5; border-radius: 6px; }
 scale slider { background: #e8fff7; min-width: 15px; min-height: 15px; border-radius: 50%; }
@@ -38,11 +39,13 @@ def label(text, style=None, xalign=0):
 
 
 class Card(Gtk.Box):
-    def __init__(self, gpu, changed):
+    def __init__(self, gpu, changed, clock_changed):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.get_style_context().add_class("card")
         self.gpu = gpu
         self.block = False
+        self.clock_known = False
+        self.clock_target = None
         self.pack_start(label(gpu.name, "gpu-name"), False, False, 0)
         self.pack_start(label(f"PCI {gpu.bus} · {gpu.uuid[-8:]}", "muted"), False, False, 0)
         row = self.row = Gtk.Box(spacing=12)
@@ -65,12 +68,41 @@ class Card(Gtk.Box):
             self.scale.set_value(gpu.limit)
         self.scale.connect("value-changed", lambda widget: None if self.block else changed(gpu.uuid, widget.get_value()))
         row.pack_start(self.draw, False, False, 0)
-        row.pack_start(self.scale, True, True, 0)
+        sliders = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sliders.pack_start(self.scale, False, False, 0)
+        self.clock_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, max(1, len(gpu.clock_options)), 1)
+        self.clock_scale.set_digits(0)
+        self.clock_scale.set_value_pos(Gtk.PositionType.TOP)
+        self.clock_scale.set_hexpand(True)
+        self.clock_scale.set_sensitive(bool(gpu.clock_options))
+        self.clock_scale.connect("format-value", self.clock_text)
+        self.clock_scale.connect("value-changed", lambda widget: None if self.block else clock_changed(gpu.uuid, self.clock_value()))
+        sliders.pack_start(self.clock_scale, False, False, 0)
+        row.pack_start(sliders, True, True, 0)
         row.pack_start(self.temp, False, False, 0)
         self.pack_start(row, False, False, 0)
         self.detail = label("", "muted")
         self.pack_start(self.detail, False, False, 0)
         self.update(gpu, False)
+
+    def clock_value(self):
+        index = round(self.clock_scale.get_value())
+        return None if index == 0 else self.gpu.clock_options[min(index - 1, len(self.gpu.clock_options) - 1)]
+
+    def clock_text(self, _scale, value):
+        if not self.gpu.clock_options:
+            return "GPU clock unavailable"
+        if not self.clock_known:
+            return "GPU clock limit: select / Auto"
+        index = round(value)
+        return "GPU clock: Auto" if index == 0 else f"GPU clock limit: {self.gpu.clock_options[min(index - 1, len(self.gpu.clock_options) - 1)]} MHz"
+
+    def set_clock_value(self, value, known=True):
+        self.clock_known = known
+        self.block = True
+        self.clock_scale.set_value(0 if value is None else self.gpu.clock_options.index(value) + 1)
+        self.clock_scale.queue_draw()
+        self.block = False
 
     def set_value(self, value):
         self.block = True
@@ -81,8 +113,11 @@ class Card(Gtk.Box):
         self.gpu = gpu
         self.draw.set_text("— W" if gpu.draw is None else f"{gpu.draw:.1f} W")
         self.temp.set_text("— °C" if gpu.temperature is None else f"{gpu.temperature:.0f} °C")
-        self.detail.set_text("Power limit control unavailable" if not gpu.adjustable else
-                             f"Applied: {gpu.limit:g} W" + (" · Applying…" if pending else ""))
+        clock = "—" if gpu.clock is None else f"{gpu.clock:g}"
+        self.detail.set_text(("Power limit unavailable" if not gpu.adjustable else f"Applied: {gpu.limit:g} W, {clock} MHz") + (" · Applying…" if pending else ""))
+        self.detail.set_tooltip_text("Watts: driver power limit. MHz: live measured GPU clock; it may be below the selected ceiling.")
+        self.clock_scale.set_sensitive(bool(gpu.clock_options))
+        self.clock_scale.set_range(0, max(1, len(gpu.clock_options)))
         if not pending and gpu.adjustable and not self.scale.has_focus():
             self.set_value(gpu.limit)
 
@@ -96,6 +131,10 @@ class App(Gtk.Application):
         self.cards = {}
         self.detected = []
         self.pending = {}
+        self.clock_pending = {}
+        self.clock_busy = set()
+        self.clock_timers = {}
+        self.clock_applied = {}
         self.timers = {}
         self.busy = set()
         self.polling = False
@@ -159,6 +198,9 @@ class App(Gtk.Application):
         hide = Gtk.Button(label="Hide")
         hide.connect("clicked", lambda *_: self.hide())
         header.pack_end(hide, False, False, 0)
+        self.reset_clock_button = Gtk.Button(label="Reset (Auto) clock")
+        self.reset_clock_button.connect("clicked", lambda *_: self.reset_clocks())
+        header.pack_end(self.reset_clock_button, False, False, 0)
         outer.pack_start(header, False, False, 0)
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -215,7 +257,7 @@ class App(Gtk.Application):
         self.closed = True
         if self.poll_source:
             GLib.source_remove(self.poll_source)
-        for source in self.timers.values():
+        for source in list(self.timers.values()) + list(self.clock_timers.values()):
             GLib.source_remove(source)
         self.timers.clear()
         if self.window:
@@ -233,7 +275,8 @@ class App(Gtk.Application):
         return True
 
     def controls(self):
-        idle = not self.pending and not self.busy
+        idle = not self.pending and not self.busy and not self.clock_pending and not self.clock_busy
+        self.reset_clock_button.set_sensitive(any(c.gpu.clock_options for c in self.cards.values()))
         self.save_button.set_sensitive(idle and any(c.gpu.adjustable for c in self.cards.values()))
         self.load_button.set_sensitive(idle and bool(self.cards))
 
@@ -283,11 +326,11 @@ class App(Gtk.Application):
                         GLib.source_remove(self.timers.pop(uuid))
             for gpu in gpus:
                 if gpu.uuid not in self.cards:
-                    self.cards[gpu.uuid] = Card(gpu, self.changed)
+                    self.cards[gpu.uuid] = Card(gpu, self.changed, self.clock_changed)
 
                 card = self.cards[gpu.uuid]
                 card.scale.set_sensitive(gpu.adjustable)
-                card.update(gpu, gpu.uuid in self.pending or gpu.uuid in self.busy)
+                card.update(gpu, gpu.uuid in self.pending or gpu.uuid in self.busy or gpu.uuid in self.clock_pending or gpu.uuid in self.clock_busy)
             self.layout_cards()
             self.rows.show_all()
             self.controls()
@@ -336,7 +379,7 @@ class App(Gtk.Application):
         self.apply_scale(*self.window.get_size())
 
     def base_size(self):
-        return (530 if len(self.cards) <= 4 else 1050, 280 + 145 * min(4, max(1, len(self.cards))))
+        return (530 if len(self.cards) <= 4 else 1050, 280 + 175 * min(4, max(1, len(self.cards))))
 
     def apply_scale(self, width, height):
         base_w, base_h = self.base_size()
@@ -377,6 +420,67 @@ class App(Gtk.Application):
                 self.saved_size = self.last_size
             except (OSError, ValueError) as exc:
                 self.message(f"Could not save window size: {exc}")
+        return False
+
+    def clock_changed(self, uuid, value):
+        targets = self.cards.items() if self.link_check.get_active() else [(uuid, self.cards[uuid])]
+        for target, card in targets:
+            if card.gpu.clock_options:
+                selected = None if value is None else min(card.gpu.clock_options, key=lambda x: abs(x - value))
+                self.queue_clock(target, selected)
+
+    def queue_clock(self, uuid, value):
+        self.cards[uuid].set_clock_value(value)
+        self.clock_pending[uuid] = value
+        if uuid in self.clock_timers:
+            GLib.source_remove(self.clock_timers.pop(uuid))
+        self.clock_timers[uuid] = GLib.timeout_add(400, self.dispatch_clock, uuid)
+        self.controls()
+
+    def reset_clocks(self):
+        for uuid, card in self.cards.items():
+            if card.gpu.clock_options:
+                self.queue_clock(uuid, None)
+
+    def dispatch_clock(self, uuid):
+        self.clock_timers.pop(uuid, None)
+        if uuid in self.clock_busy or uuid not in self.clock_pending:
+            return False
+        value = self.clock_pending.pop(uuid)
+        if uuid not in self.cards:
+            return False
+        self.clock_busy.add(uuid)
+        self.controls()
+        self.apply_pool.submit(self.clock_worker, uuid, value)
+        return False
+
+    def clock_worker(self, uuid, value):
+        try:
+            apply_clock(uuid, value)
+            error = None
+        except Exception as exc:
+            error = str(exc)
+        GLib.idle_add(self.clock_finished, uuid, value, error)
+
+    def clock_finished(self, uuid, value, error):
+        if self.closed:
+            return False
+        self.clock_busy.discard(uuid)
+        if error:
+            self.load_errors.append(error)
+            self.message(f"Clock change failed: {error}")
+            if uuid in self.cards and uuid not in self.clock_pending:
+                self.cards[uuid].set_clock_value(self.clock_applied.get(uuid), uuid in self.clock_applied)
+        else:
+            self.clock_applied[uuid] = value
+            self.message("GPU clock: Auto · SAVE to remember" if value is None else f"GPU clock limit: {value} MHz · SAVE to remember")
+        if uuid in self.clock_pending:
+            if uuid in self.clock_timers:
+                GLib.source_remove(self.clock_timers.pop(uuid))
+            self.dispatch_clock(uuid)
+        self.finish_loading()
+        self.controls()
+        self.poll()
         return False
 
     def dispatch(self, uuid):
@@ -422,29 +526,41 @@ class App(Gtk.Application):
             if uuid in self.timers:
                 GLib.source_remove(self.timers.pop(uuid))
             self.dispatch(uuid)
-        if self.loading and not self.busy and not self.pending:
-            self.message("; ".join(self.load_errors) if self.load_errors else "Saved limits applied")
-            self.loading = False
+        self.finish_loading()
         self.controls()
         self.poll()
         return False
 
+    def finish_loading(self):
+        if self.loading and not (self.busy or self.pending or self.clock_busy or self.clock_pending):
+            self.message("; ".join(self.load_errors) if self.load_errors else "Saved power and clock limits applied")
+            self.loading = False
+
     def save(self):
         try:
             limits = {u: c.gpu.validate(c.scale.get_value()) for u, c in self.cards.items() if c.gpu.adjustable}
-            self.settings.save_limits(limits)
+            self.settings.save_limits(limits, self.clock_applied)
             self.message("Limits saved · " + ("Will apply at login" if self.start_check.get_active() else "Autostart is off"))
         except (OSError, ValueError) as exc:
             self.message(f"Could not save: {exc}")
 
     def load(self):
         try:
-            saved = self.settings.read()["limits"]
+            profile = self.settings.read()
+            saved = profile["limits"]
             targets, errors = load_targets(self.detected, saved)
         except (OSError, ValueError) as exc:
             self.message(f"Could not load: {exc}")
             return
-        if not targets:
+        for uuid, value in profile.get("clocks", {}).items():
+            if uuid not in self.cards:
+                continue
+            card = self.cards[uuid]
+            if not card.gpu.clock_options or (value is not None and value not in card.gpu.clock_options):
+                errors.append(f"{card.gpu.name}: saved clock unavailable")
+                continue
+            self.queue_clock(uuid, value)
+        if not targets and not self.clock_pending:
             self.message("; ".join(errors) if errors else "No saved limits yet. Choose limits and press SAVE.")
             return
         self.loading = True

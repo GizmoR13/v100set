@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 SMI = "/usr/bin/nvidia-smi"
 HELPER = "/usr/local/libexec/v100set-power"
@@ -33,6 +33,9 @@ class GPU:
     minimum: float | None
     maximum: float | None
     temperature: float | None
+
+    clock: float | None = None
+    clock_options: tuple = ()
 
     @property
     def adjustable(self):
@@ -76,7 +79,41 @@ def discover():
                             capture_output=True, text=True, timeout=8, check=False)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "NVIDIA driver unavailable")
-    return parse_gpus(result.stdout)
+    gpus = parse_gpus(result.stdout)
+    # Telemetry failure must not make power controls unavailable.
+    for i, gpu in enumerate(gpus):
+        if not is_v100(gpu):
+            continue
+        try:
+            clocks = subprocess.run([SMI, "-i", gpu.uuid, "--query-gpu=clocks.current.graphics", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=8, check=True)
+            options = supported_clocks(gpu.uuid)
+            gpus[i] = replace(gpu, clock=number(clocks.stdout.strip()), clock_options=options)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return gpus
+
+
+_CLOCK_OPTIONS = {}
+
+def supported_clocks(uuid):
+    if uuid not in _CLOCK_OPTIONS:
+        result = subprocess.run([SMI, "-i", uuid, "--query-supported-clocks=memory,graphics", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=8, check=True)
+        rows = list(csv.reader(result.stdout.splitlines()))
+        # Use the highest supported memory clock; memory itself is never changed.
+        pairs = [(int(row[0].strip()), int(row[1].strip())) for row in rows]
+        memory = max(m for m, _ in pairs)
+        _CLOCK_OPTIONS[uuid] = tuple(sorted({c for m, c in pairs if m == memory}))
+    return _CLOCK_OPTIONS[uuid]
+
+
+def apply_clock(uuid, mhz):
+    value = "auto" if mhz is None else str(int(mhz))
+    result = subprocess.run(["/usr/bin/sudo", "-n", HELPER, uuid, "clock", value], capture_output=True, text=True, timeout=25, check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "GPU clock request failed")
+    if result.stdout.strip() != value:
+        raise RuntimeError("Unexpected clock acknowledgement")
+    return mhz
 
 
 def apply_limit(uuid, watts):
@@ -120,6 +157,9 @@ class Settings:
         for uuid, watts in data["limits"].items():
             if not isinstance(uuid, str) or isinstance(watts, bool) or number(watts) is None:
                 raise ValueError("Invalid saved power limit")
+        clocks = data.get("clocks", {})
+        if not isinstance(clocks, dict) or any(not isinstance(u, str) or (v is not None and (type(v) is not int or v <= 0)) for u, v in clocks.items()):
+            raise ValueError("Invalid saved GPU clocks")
         return data
 
     def write(self, data):
@@ -147,9 +187,11 @@ class Settings:
         data.update(values)
         self.write(data)
 
-    def save_limits(self, limits):
+    def save_limits(self, limits, clocks=None):
         data = self.read()
         data["limits"].update(limits)
+        if clocks is not None:
+            data.setdefault("clocks", {}).update(clocks)
         self.write(data)
 
 

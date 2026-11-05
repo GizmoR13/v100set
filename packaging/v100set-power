@@ -47,11 +47,36 @@ def set_limit(args):
     return actual
 
 
+def set_clock(args):
+    if len(args) != 3 or args[1] != "clock":
+        raise ValueError("Expected UUID clock MHz|auto")
+    uuid, _ = validate_request([args[0], "1"])
+    value = args[2]
+    if value != "auto" and not re.fullmatch(r"[0-9]{1,4}", value):
+        raise ValueError("Invalid GPU clock")
+    rows = list(csv.reader(run("-i", uuid, "--query-gpu=uuid,name", "--format=csv,noheader,nounits").splitlines()))
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][0].strip() != uuid or not re.search(r"\bV100S?\b", rows[0][1]):
+        raise ValueError("Clock control requires a verified V100 GPU")
+    if value == "auto":
+        run("-i", uuid, "-rgc")
+        return "auto"
+    pairs = [(int(m.strip()), int(c.strip())) for m, c in csv.reader(run("-i", uuid, "--query-supported-clocks=memory,graphics", "--format=csv,noheader,nounits").splitlines())]
+    memory = max(m for m, _ in pairs)
+    clocks = sorted({c for m, c in pairs if m == memory})
+    if int(value) not in clocks:
+        raise ValueError("Clock is not in the GPU's supported list")
+    # A range preserves dynamic clocking below the requested ceiling.
+    run("-i", uuid, "-lgc", f"{clocks[0]},{int(value)}")
+    # Command success acknowledges the policy, not an instantaneous MHz reading.
+    return str(int(value))
+
+
 if __name__ == "__main__":
     try:
         if os.geteuid() != 0:
             raise PermissionError("Administrator installation is required")
-        print(set_limit(sys.argv[1:]))
+        args = sys.argv[1:]
+        print(set_clock(args) if len(args) == 3 else set_limit(args))
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

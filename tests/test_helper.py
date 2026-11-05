@@ -51,3 +51,29 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs['cwd'], '/')
             self.assertNotIn('shell', run.call_args.kwargs)
             self.assertEqual(run.call_args.kwargs['env'], helper.ENV)
+
+class ClockHelperTests(unittest.TestCase):
+    def test_clock_range_is_validated_and_lower_bound_preserved(self):
+        with patch.object(helper, 'run', side_effect=[f'{UUID}, Tesla V100-PCIE-32GB', '877, 135\n877, 900\n877, 1380', 'ok']) as run:
+            self.assertEqual(helper.set_clock([UUID, 'clock', '900']), '900')
+            self.assertEqual(run.call_args.args, ('-i', UUID, '-lgc', '135,900'))
+
+    def test_bad_clock_never_mutates(self):
+        for value in ['901', '0', '9999']:
+            with patch.object(helper, 'run', side_effect=[f'{UUID}, Tesla V100', '877,135\n877,900']) as run:
+                with self.assertRaises(ValueError): helper.set_clock([UUID, 'clock', value])
+                self.assertEqual(run.call_count, 2)
+        for value in ['-1','900;id','NaN','900.0']:
+            with patch.object(helper, 'run') as run:
+                with self.assertRaises(ValueError): helper.set_clock([UUID,'clock',value])
+                run.assert_not_called()
+
+    def test_other_gpu_rejected(self):
+        with patch.object(helper, 'run', return_value=f'{UUID}, NVIDIA RTX A400') as run:
+            with self.assertRaises(ValueError): helper.set_clock([UUID,'clock','auto'])
+            self.assertEqual(run.call_count, 1)
+
+    def test_auto_only_resets_gpu_clock(self):
+        with patch.object(helper,'run',side_effect=[f'{UUID}, Tesla V100', 'ok']) as run:
+            self.assertEqual(helper.set_clock([UUID,'clock','auto']), 'auto')
+            self.assertEqual(run.call_args.args, ('-i',UUID,'-rgc'))
