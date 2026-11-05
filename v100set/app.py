@@ -48,7 +48,7 @@ class Card(Gtk.Box):
         self.clock_target = None
         self.pack_start(label(gpu.name, "gpu-name"), False, False, 0)
         self.pack_start(label(f"PCI {gpu.bus} · {gpu.uuid[-8:]}", "muted"), False, False, 0)
-        row = self.row = Gtk.Box(spacing=12)
+        row = self.row = Gtk.Grid(column_spacing=12, row_spacing=5)
         self.draw = label("— W", "reading")
         self.draw.set_size_request(75, -1)
         self.temp = label("— °C", "reading", 1)
@@ -67,9 +67,7 @@ class Card(Gtk.Box):
             self.scale.set_tooltip_text(f"Range: {gpu.minimum:g}–{gpu.maximum:g} W · 5 W steps. Changes apply live.")
             self.scale.set_value(gpu.limit)
         self.scale.connect("value-changed", lambda widget: None if self.block else changed(gpu.uuid, widget.get_value()))
-        row.pack_start(self.draw, False, False, 0)
-        sliders = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        sliders.pack_start(self.scale, False, False, 0)
+        self.clock_reading = label("— MHz", "reading")
         self.clock_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, max(1, len(gpu.clock_options)), 1)
         self.clock_scale.set_digits(0)
         self.clock_scale.set_value_pos(Gtk.PositionType.TOP)
@@ -77,13 +75,47 @@ class Card(Gtk.Box):
         self.clock_scale.set_sensitive(bool(gpu.clock_options))
         self.clock_scale.connect("format-value", self.clock_text)
         self.clock_scale.connect("value-changed", lambda widget: None if self.block else clock_changed(gpu.uuid, self.clock_value()))
-        sliders.pack_start(self.clock_scale, False, False, 0)
-        row.pack_start(sliders, True, True, 0)
-        row.pack_start(self.temp, False, False, 0)
+        self.reading_boxes = []
+        self.alignment_pending = False
+        self.reading_positions = {}
+        for index, (reading, scale) in enumerate(((self.draw, self.scale), (self.clock_reading, self.clock_scale))):
+            box = Gtk.Fixed()
+            box.set_size_request(85, -1)
+            box.put(reading, 0, 0)
+            self.reading_boxes.append(box)
+            row.attach(box, 0, index, 1, 1)
+            row.attach(scale, 1, index, 1, 1)
+            scale.connect("size-allocate", self.align_readings)
+        self.temp.set_valign(Gtk.Align.CENTER)
+        self.temp.set_margin_top(14)
+        row.attach(self.temp, 2, 0, 1, 2)
+        row.connect("size-allocate", self.align_readings)
         self.pack_start(row, False, False, 0)
         self.detail = label("", "muted")
+        self.detail.set_margin_top(5)
         self.pack_start(self.detail, False, False, 0)
         self.update(gpu, False)
+
+    def align_readings(self, *_args):
+        if not self.alignment_pending:
+            self.alignment_pending = True
+            GLib.idle_add(self.position_readings)
+
+    def move_reading(self, box, reading, y):
+        if self.reading_positions.get(reading) != y:
+            self.reading_positions[reading] = y
+            box.move(reading, 0, y)
+
+    def position_readings(self):
+        self.alignment_pending = False
+        if not self.get_mapped():
+            return False
+        for box, reading, scale in zip(self.reading_boxes, (self.draw, self.clock_reading), (self.scale, self.clock_scale)):
+            rect = scale.get_range_rect()
+            center = rect.y + rect.height / 2
+            height = reading.get_preferred_height().natural_height
+            self.move_reading(box, reading, max(0, round(center - height / 2)))
+        return False
 
     def clock_value(self):
         index = round(self.clock_scale.get_value())
@@ -114,6 +146,7 @@ class Card(Gtk.Box):
         self.draw.set_text("— W" if gpu.draw is None else f"{gpu.draw:.1f} W")
         self.temp.set_text("— °C" if gpu.temperature is None else f"{gpu.temperature:.0f} °C")
         clock = "—" if gpu.clock is None else f"{gpu.clock:g}"
+        self.clock_reading.set_text(f"{clock} MHz")
         self.detail.set_text(("Power limit unavailable" if not gpu.adjustable else f"Applied: {gpu.limit:g} W, {clock} MHz") + (" · Applying…" if pending else ""))
         self.detail.set_tooltip_text("Watts: driver power limit. MHz: live measured GPU clock; it may be below the selected ceiling.")
         self.clock_scale.set_sensitive(bool(gpu.clock_options))
@@ -192,9 +225,8 @@ class App(Gtk.Application):
         outer = self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         outer.get_style_context().add_class("panel")
         self.window.add(outer)
-        outer.pack_start(label("NVIDIA POWER CONTROL", "muted"), False, False, 0)
         header = self.header = Gtk.Box(spacing=10)
-        header.pack_start(label("v100set", "title"), True, True, 0)
+        header.pack_start(label("NVIDIA POWER CONTROL", "muted"), True, True, 0)
         hide = Gtk.Button(label="Hide")
         hide.connect("clicked", lambda *_: self.hide())
         header.pack_end(hide, False, False, 0)
@@ -396,7 +428,13 @@ class App(Gtk.Application):
         self.rows.set_column_spacing(gap)
         for card in self.cards.values():
             card.set_spacing(round(6 * factor))
-            card.row.set_spacing(round(12 * factor))
+            card.row.set_column_spacing(round(12 * factor))
+            card.row.set_row_spacing(round(5 * factor))
+            card.detail.set_margin_top(round(5 * factor))
+            for box in card.reading_boxes:
+                box.set_size_request(round(85 * factor), -1)
+            card.temp.set_margin_top(round(14 * factor))
+            card.clock_reading.set_size_request(round(85 * factor), -1)
             card.draw.set_size_request(round(75 * factor), -1)
             card.temp.set_size_request(round(60 * factor), -1)
             card.scale.set_size_request(round(220 * factor), -1)
